@@ -204,10 +204,7 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 		if mbr.Partitions[i].Type != 0x05 && mbr.Partitions[i].Type != 0x0f {
 			continue
 		}
-		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to parse extended partition: %w", err)
-		}
+		logicals := parseEBRChain(sr, mbr.Partitions[i].StartSector)
 		if len(logicals) > 0 {
 			mbr.logicalPartitions = append(mbr.logicalPartitions, logicals...)
 		} else {
@@ -256,7 +253,7 @@ func parsePartitionEntry(buf []byte) Partition {
 // Each EBR has the same 512-byte structure as an MBR:
 //   - Entry 0: logical partition (StartSector relative to this EBR)
 //   - Entry 1: next EBR pointer (StartSector relative to extStartSector)
-func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, error) {
+func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 	var partitions []Partition
 	ebrSector := extStartSector
 	visited := make(map[uint32]bool)
@@ -299,5 +296,5 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, er
 		ebrSector = extStartSector + entry1.StartSector
 	}
 
-	return partitions, nil
+	return partitions
 }
