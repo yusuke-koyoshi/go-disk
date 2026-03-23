@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	SIGNATURE = 0xAA55
-	Sector    = 512
+	SIGNATURE        = 0xAA55
+	Sector           = 512
+	maxEBRChainDepth = 256
 )
 
 /*
@@ -59,8 +60,10 @@ type MasterBootRecord struct {
 	Partitions             [4]Partition
 	Signature              uint16
 
-	currentPartition *Partition
-	sectionReader    *io.SectionReader
+	logicalPartitions []Partition
+	currentIndex      int
+	currentPartition  *Partition
+	sectionReader     *io.SectionReader
 }
 
 type CHS [3]byte
@@ -80,24 +83,32 @@ type Partition struct {
 }
 
 func (m *MasterBootRecord) Next() (types.Partition, error) {
-	index := 0
 	if m.currentPartition != nil {
 		m.currentPartition.sectionReader = nil
-		index = m.currentPartition.index + 1
 	}
-	if len(m.Partitions) <= index {
+
+	total := len(m.Partitions) + len(m.logicalPartitions)
+	if m.currentIndex >= total {
 		return nil, io.EOF
 	}
 
-	m.currentPartition = &m.Partitions[index]
-	offset := int64(m.currentPartition.GetStartSector()) * 512
+	var p *Partition
+	if m.currentIndex < len(m.Partitions) {
+		p = &m.Partitions[m.currentIndex]
+	} else {
+		p = &m.logicalPartitions[m.currentIndex-len(m.Partitions)]
+	}
+	m.currentIndex++
+
+	offset := int64(p.GetStartSector()) * 512
 	_, err := m.sectionReader.Seek(offset, 0)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to seek partition(%d): %w", m.currentPartition.Index(), err)
+		return nil, xerrors.Errorf("failed to seek partition(%d): %w", p.Index(), err)
 	}
-	m.currentPartition.sectionReader = io.NewSectionReader(m.sectionReader, offset, int64(m.currentPartition.GetSize()*512))
+	p.sectionReader = io.NewSectionReader(m.sectionReader, offset, int64(p.GetSize()*512))
 
-	return m.currentPartition, nil
+	m.currentPartition = p
+	return p, nil
 }
 
 func (p Partition) Index() int {
@@ -193,18 +204,24 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 		if mbr.Partitions[i].Type != 0x05 && mbr.Partitions[i].Type != 0x0f {
 			continue
 		}
-		_, err := sr.Seek(int64(mbr.Partitions[i].StartSector)<<9, 0)
+		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to seek to extended boot record: %w", err)
+			return nil, xerrors.Errorf("failed to parse extended partition: %w", err)
 		}
-		_, err = NewMasterBootRecord(sr)
-		if xerrors.Is(err, InvalidSignature) {
-			mbr.Partitions[i].StartSector = mbr.Partitions[i].StartSector + 2
-			mbr.Partitions[i].Size = mbr.Partitions[i].Size - 2
+		if len(logicals) > 0 {
+			mbr.logicalPartitions = append(mbr.logicalPartitions, logicals...)
 		} else {
-			// TODO: Support Extended Master Boot Record
-			return nil, xerrors.New("unsupported extended master boot record")
+			// No valid EBR found; adjust partition to skip past the EBR area.
+			mbr.Partitions[i].StartSector += 2
+			if mbr.Partitions[i].Size >= 2 {
+				mbr.Partitions[i].Size -= 2
+			}
 		}
+	}
+
+	// Assign indices to logical partitions (starting at 4)
+	for i := range mbr.logicalPartitions {
+		mbr.logicalPartitions[i].index = len(mbr.Partitions) + i
 	}
 
 	if emptyPartitions == len(mbr.Partitions) {
@@ -216,4 +233,66 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 
 func (p Partition) IsSupported() bool {
 	return true
+}
+
+func parsePartitionEntry(buf []byte) Partition {
+	return Partition{
+		Boot:        buf[0] != 0,
+		StartCHS:    CHS{buf[1], buf[2], buf[3]},
+		Type:        buf[4],
+		EndCHS:      CHS{buf[5], buf[6], buf[7]},
+		StartSector: binary.LittleEndian.Uint32(buf[8:12]),
+		Size:        binary.LittleEndian.Uint32(buf[12:16]),
+	}
+}
+
+// parseEBRChain traverses the Extended Boot Record chain starting at
+// extStartSector and returns all logical partitions found.
+// Each EBR has the same 512-byte structure as an MBR:
+//   - Entry 0: logical partition (StartSector relative to this EBR)
+//   - Entry 1: next EBR pointer (StartSector relative to extStartSector)
+func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, error) {
+	var partitions []Partition
+	ebrSector := extStartSector
+	visited := make(map[uint32]bool)
+
+	for len(partitions) < maxEBRChainDepth {
+		if visited[ebrSector] {
+			break
+		}
+		visited[ebrSector] = true
+
+		ebrOffset := int64(ebrSector) * Sector
+		_, err := sr.Seek(ebrOffset, 0)
+		if err != nil {
+			break
+		}
+
+		buf := make([]byte, Sector)
+		n, err := sr.Read(buf)
+		if err != nil || n != Sector {
+			break
+		}
+
+		sig := binary.LittleEndian.Uint16(buf[510:512])
+		if sig != SIGNATURE {
+			break
+		}
+
+		// Entry 0: logical partition (StartSector relative to this EBR)
+		entry0 := parsePartitionEntry(buf[446:462])
+		if entry0.Type != 0 {
+			entry0.StartSector += ebrSector
+			partitions = append(partitions, entry0)
+		}
+
+		// Entry 1: next EBR pointer (StartSector relative to extended partition start)
+		entry1 := parsePartitionEntry(buf[462:478])
+		if entry1.Type == 0 || entry1.StartSector == 0 {
+			break
+		}
+		ebrSector = extStartSector + entry1.StartSector
+	}
+
+	return partitions, nil
 }
