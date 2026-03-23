@@ -224,7 +224,7 @@ func TestMasterBootRecord_Next_ExtendedSingleLogical(t *testing.T) {
 
 	// MBR at sector 0
 	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
-	writePartitionEntry(buf[462:], false, 0x05, 10, 20) // partition 1: extended
+	writePartitionEntry(buf[462:], false, 0x0f, 10, 20) // partition 1: extended (LBA)
 	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
 
 	// EBR 1 at sector 10
@@ -245,7 +245,7 @@ func TestMasterBootRecord_Next_ExtendedSingleLogical(t *testing.T) {
 		marker byte
 	}{
 		{0, 4, 0xAA},  // primary 0
-		{1, 20, 0x00}, // extended (container)
+		{1, 20, 0x00}, // extended LBA (container)
 		{2, 0, 0x00},  // empty
 		{3, 0, 0x00},  // empty
 		{4, 5, 0xCC},  // logical 4
