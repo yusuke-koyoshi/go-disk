@@ -198,7 +198,7 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 			return nil, xerrors.Errorf("failed to seek to extended boot record: %w", err)
 		}
 		_, err = NewMasterBootRecord(sr)
-		if xerrors.Is(InvalidSignature, err) {
+		if xerrors.Is(err, InvalidSignature) {
 			mbr.Partitions[i].StartSector = mbr.Partitions[i].StartSector + 2
 			mbr.Partitions[i].Size = mbr.Partitions[i].Size - 2
 		} else {
