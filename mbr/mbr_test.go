@@ -209,6 +209,240 @@ func TestMasterBootRecord_Next(t *testing.T) {
 	}
 }
 
+func TestMasterBootRecord_Next_ExtendedSingleLogical(t *testing.T) {
+	// Disk layout:
+	//   Sector 0:    MBR
+	//   Sector 2-5:  Primary partition 0 (Type 0x83, Size 4)
+	//   Sector 10:   EBR 1
+	//   Sector 11-15: Logical partition 4 (Type 0x83, Size 5)
+	diskSize := 30 * 512
+	buf := make([]byte, diskSize)
+
+	// Marker bytes
+	buf[2*512] = 0xAA  // primary partition 0 data
+	buf[11*512] = 0xCC // logical partition 4 data
+
+	// MBR at sector 0
+	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
+	writePartitionEntry(buf[462:], false, 0x05, 10, 20) // partition 1: extended
+	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
+
+	// EBR 1 at sector 10
+	ebr1 := 10 * 512
+	writePartitionEntry(buf[ebr1+446:], false, 0x83, 1, 5) // entry 0: logical (abs sector=10+1=11)
+	// entry 1: no next EBR (type=0)
+	binary.LittleEndian.PutUint16(buf[ebr1+510:], 0xAA55)
+
+	sr := io.NewSectionReader(newReaderAt(buf), 0, int64(len(buf)))
+	m, err := mbr.NewMasterBootRecord(sr)
+	if err != nil {
+		t.Fatalf("NewMasterBootRecord() unexpected error: %v", err)
+	}
+
+	expected := []struct {
+		index  int
+		size   uint64
+		marker byte
+	}{
+		{0, 4, 0xAA},  // primary 0
+		{1, 20, 0x00}, // extended (container)
+		{2, 0, 0x00},  // empty
+		{3, 0, 0x00},  // empty
+		{4, 5, 0xCC},  // logical 4
+	}
+
+	for i, exp := range expected {
+		p, err := m.Next()
+		if err != nil {
+			t.Fatalf("Next() call %d: unexpected error: %v", i, err)
+		}
+		if p.GetSize() != exp.size {
+			t.Errorf("partition %d: GetSize() = %d, want %d", i, p.GetSize(), exp.size)
+		}
+		if exp.size > 0 && exp.marker != 0x00 {
+			psr := p.GetSectionReader()
+			b := make([]byte, 1)
+			if _, err := psr.Read(b); err != nil {
+				t.Fatalf("partition %d: SectionReader.Read() error: %v", i, err)
+			}
+			if b[0] != exp.marker {
+				t.Errorf("partition %d: first byte = %x, want %x", i, b[0], exp.marker)
+			}
+		}
+	}
+
+	_, err = m.Next()
+	if err != io.EOF {
+		t.Errorf("Next() after all partitions: got %v, want io.EOF", err)
+	}
+}
+
+func TestMasterBootRecord_Next_ExtendedMultipleLogicals(t *testing.T) {
+	// Disk layout:
+	//   Sector 0:     MBR
+	//   Sector 2-5:   Primary partition 0 (Type 0x83, Size 4)
+	//   Sector 10:    EBR 1
+	//   Sector 11-15: Logical partition 4 (Type 0x83, Size 5)
+	//   Sector 20:    EBR 2
+	//   Sector 21-25: Logical partition 5 (Type 0x82, Size 5)
+	diskSize := 50 * 512
+	buf := make([]byte, diskSize)
+
+	// Marker bytes
+	buf[2*512] = 0xAA  // primary 0
+	buf[11*512] = 0xBB // logical 4
+	buf[21*512] = 0xCC // logical 5
+
+	// MBR at sector 0
+	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
+	writePartitionEntry(buf[462:], false, 0x05, 10, 40) // partition 1: extended
+	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
+
+	// EBR 1 at sector 10
+	ebr1 := 10 * 512
+	writePartitionEntry(buf[ebr1+446:], false, 0x83, 1, 5)   // entry 0: logical (abs=11)
+	writePartitionEntry(buf[ebr1+462:], false, 0x05, 10, 16) // entry 1: next EBR at ext_start+10=20
+	binary.LittleEndian.PutUint16(buf[ebr1+510:], 0xAA55)
+
+	// EBR 2 at sector 20
+	ebr2 := 20 * 512
+	writePartitionEntry(buf[ebr2+446:], false, 0x82, 1, 5) // entry 0: logical (abs=21)
+	// entry 1: no next EBR
+	binary.LittleEndian.PutUint16(buf[ebr2+510:], 0xAA55)
+
+	sr := io.NewSectionReader(newReaderAt(buf), 0, int64(len(buf)))
+	m, err := mbr.NewMasterBootRecord(sr)
+	if err != nil {
+		t.Fatalf("NewMasterBootRecord() unexpected error: %v", err)
+	}
+
+	expected := []struct {
+		index  int
+		typB   byte
+		size   uint64
+		marker byte
+	}{
+		{0, 0x83, 4, 0xAA},  // primary 0
+		{1, 0x05, 40, 0x00}, // extended
+		{2, 0x00, 0, 0x00},  // empty
+		{3, 0x00, 0, 0x00},  // empty
+		{4, 0x83, 5, 0xBB},  // logical 4
+		{5, 0x82, 5, 0xCC},  // logical 5
+	}
+
+	for i, exp := range expected {
+		p, err := m.Next()
+		if err != nil {
+			t.Fatalf("Next() call %d: unexpected error: %v", i, err)
+		}
+		if p.GetSize() != exp.size {
+			t.Errorf("partition %d: GetSize() = %d, want %d", i, p.GetSize(), exp.size)
+		}
+		gotType := p.GetType()
+		if len(gotType) != 1 || gotType[0] != exp.typB {
+			t.Errorf("partition %d: GetType() = %x, want %x", i, gotType, exp.typB)
+		}
+		if exp.size > 0 && exp.marker != 0x00 {
+			psr := p.GetSectionReader()
+			b := make([]byte, 1)
+			if _, err := psr.Read(b); err != nil {
+				t.Fatalf("partition %d: SectionReader.Read() error: %v", i, err)
+			}
+			if b[0] != exp.marker {
+				t.Errorf("partition %d: first byte = %x, want %x", i, b[0], exp.marker)
+			}
+		}
+	}
+
+	_, err = m.Next()
+	if err != io.EOF {
+		t.Errorf("Next() after all partitions: got %v, want io.EOF", err)
+	}
+}
+
+func TestMasterBootRecord_Next_ExtendedInvalidEBR(t *testing.T) {
+	// Extended partition with no valid EBR (invalid signature).
+	// Should fall back to adjusting StartSector +2, Size -2.
+	diskSize := 30 * 512
+	buf := make([]byte, diskSize)
+
+	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
+	writePartitionEntry(buf[462:], false, 0x05, 10, 20) // partition 1: extended
+	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
+
+	// Sector 10: no valid EBR signature (leave as zeros)
+
+	sr := io.NewSectionReader(newReaderAt(buf), 0, int64(len(buf)))
+	m, err := mbr.NewMasterBootRecord(sr)
+	if err != nil {
+		t.Fatalf("NewMasterBootRecord() unexpected error: %v", err)
+	}
+
+	// Extended partition should have StartSector adjusted to 12, Size to 18
+	expected := []struct {
+		size uint64
+	}{
+		{4},  // primary 0
+		{18}, // extended (adjusted: 20-2)
+		{0},  // empty
+		{0},  // empty
+	}
+
+	for i, exp := range expected {
+		p, err := m.Next()
+		if err != nil {
+			t.Fatalf("Next() call %d: unexpected error: %v", i, err)
+		}
+		if p.GetSize() != exp.size {
+			t.Errorf("partition %d: GetSize() = %d, want %d", i, p.GetSize(), exp.size)
+		}
+	}
+
+	// Only 4 primary partitions, no logical
+	_, err = m.Next()
+	if err != io.EOF {
+		t.Errorf("Next() after all partitions: got %v, want io.EOF", err)
+	}
+}
+
+func TestMasterBootRecord_Next_ExtendedCircularReference(t *testing.T) {
+	// EBR chain with circular reference: EBR 1 points to itself.
+	diskSize := 30 * 512
+	buf := make([]byte, diskSize)
+
+	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
+	writePartitionEntry(buf[462:], false, 0x05, 10, 20) // partition 1: extended
+	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
+
+	// EBR 1 at sector 10: entry 1 points back to sector 10 (circular)
+	ebr1 := 10 * 512
+	writePartitionEntry(buf[ebr1+446:], false, 0x83, 1, 5)  // entry 0: logical
+	writePartitionEntry(buf[ebr1+462:], false, 0x05, 0, 20) // entry 1: points to ext_start+0=10 (self)
+	binary.LittleEndian.PutUint16(buf[ebr1+510:], 0xAA55)
+
+	sr := io.NewSectionReader(newReaderAt(buf), 0, int64(len(buf)))
+	m, err := mbr.NewMasterBootRecord(sr)
+	if err != nil {
+		t.Fatalf("NewMasterBootRecord() unexpected error: %v", err)
+	}
+
+	// Should get 4 primary + 1 logical (chain stops at circular reference)
+	count := 0
+	for {
+		_, err := m.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next() unexpected error: %v", err)
+		}
+		count++
+	}
+	if count != 5 {
+		t.Errorf("partition count = %d, want 5 (4 primary + 1 logical)", count)
+	}
+}
+
 func writePartitionEntry(dst []byte, boot bool, typeByte byte, startSector, size uint32) {
 	if boot {
 		dst[0] = 0x80
