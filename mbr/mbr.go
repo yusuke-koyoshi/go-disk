@@ -236,6 +236,9 @@ func (p Partition) IsSupported() bool {
 }
 
 func parsePartitionEntry(buf []byte) Partition {
+	if len(buf) < 16 {
+		return Partition{}
+	}
 	return Partition{
 		Boot:        buf[0] != 0,
 		StartCHS:    CHS{buf[1], buf[2], buf[3]},
