@@ -212,9 +212,11 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 			mbr.logicalPartitions = append(mbr.logicalPartitions, logicals...)
 		} else {
 			// No valid EBR found; adjust partition to skip past the EBR area.
-			mbr.Partitions[i].StartSector += 2
-			if mbr.Partitions[i].Size >= 2 {
+			if mbr.Partitions[i].Size > 2 {
+				mbr.Partitions[i].StartSector += 2
 				mbr.Partitions[i].Size -= 2
+			} else {
+				mbr.Partitions[i].Size = 0
 			}
 		}
 	}
