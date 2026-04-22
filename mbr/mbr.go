@@ -257,6 +257,7 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 	var partitions []Partition
 	ebrSector := extStartSector
 	visited := make(map[uint32]bool)
+	buf := make([]byte, Sector)
 
 	for len(partitions) < maxEBRChainDepth {
 		if visited[ebrSector] {
@@ -270,7 +271,6 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 			break
 		}
 
-		buf := make([]byte, Sector)
 		n, err := sr.Read(buf)
 		if err != nil || n != Sector {
 			break
