@@ -240,15 +240,14 @@ func TestMasterBootRecord_Next_ExtendedSingleLogical(t *testing.T) {
 	}
 
 	expected := []struct {
-		index  int
 		size   uint64
 		marker byte
 	}{
-		{0, 4, 0xAA},  // primary 0
-		{1, 20, 0x00}, // extended LBA (container)
-		{2, 0, 0x00},  // empty
-		{3, 0, 0x00},  // empty
-		{4, 5, 0xCC},  // logical 4
+		{4, 0xAA},  // primary 0
+		{20, 0x00}, // extended LBA (container)
+		{0, 0x00},  // empty
+		{0, 0x00},  // empty
+		{5, 0xCC},  // logical 4
 	}
 
 	for i, exp := range expected {
@@ -317,17 +316,16 @@ func TestMasterBootRecord_Next_ExtendedMultipleLogicals(t *testing.T) {
 	}
 
 	expected := []struct {
-		index  int
 		typB   byte
 		size   uint64
 		marker byte
 	}{
-		{0, 0x83, 4, 0xAA},  // primary 0
-		{1, 0x05, 40, 0x00}, // extended
-		{2, 0x00, 0, 0x00},  // empty
-		{3, 0x00, 0, 0x00},  // empty
-		{4, 0x83, 5, 0xBB},  // logical 4
-		{5, 0x82, 5, 0xCC},  // logical 5
+		{0x83, 4, 0xAA},  // primary 0
+		{0x05, 40, 0x00}, // extended
+		{0x00, 0, 0x00},  // empty
+		{0x00, 0, 0x00},  // empty
+		{0x83, 5, 0xBB},  // logical 4
+		{0x82, 5, 0xCC},  // logical 5
 	}
 
 	for i, exp := range expected {
