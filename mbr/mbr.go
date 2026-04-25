@@ -259,7 +259,7 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 	visited := make(map[uint32]bool)
 	buf := make([]byte, Sector)
 
-	for len(partitions) < maxEBRChainDepth {
+	for hops := 0; hops < maxEBRChainDepth; hops++ {
 		if visited[ebrSector] {
 			break
 		}
