@@ -204,7 +204,10 @@ func NewMasterBootRecord(sr *io.SectionReader) (*MasterBootRecord, error) {
 		if mbr.Partitions[i].Type != 0x05 && mbr.Partitions[i].Type != 0x0f {
 			continue
 		}
-		logicals := parseEBRChain(sr, mbr.Partitions[i].StartSector)
+		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to parse extended partition %d: %w", i, err)
+		}
 		if len(logicals) > 0 {
 			mbr.logicalPartitions = append(mbr.logicalPartitions, logicals...)
 		} else {
@@ -253,7 +256,12 @@ func parsePartitionEntry(buf []byte) Partition {
 // Each EBR has the same 512-byte structure as an MBR:
 //   - Entry 0: logical partition (StartSector relative to this EBR)
 //   - Entry 1: next EBR pointer (StartSector relative to extStartSector)
-func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
+//
+// I/O failures (seek/read/short read) are returned as errors so the
+// caller can distinguish a malformed/truncated image from a legitimate
+// "no EBR" case (signature mismatch), which terminates the chain
+// without an error and lets the caller apply a fallback.
+func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, error) {
 	var partitions []Partition
 	ebrSector := extStartSector
 	visited := make(map[uint32]bool)
@@ -266,14 +274,12 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 		visited[ebrSector] = true
 
 		ebrOffset := int64(ebrSector) * Sector
-		_, err := sr.Seek(ebrOffset, 0)
-		if err != nil {
-			break
+		if _, err := sr.Seek(ebrOffset, 0); err != nil {
+			return nil, xerrors.Errorf("failed to seek EBR at sector %d: %w", ebrSector, err)
 		}
 
-		n, err := sr.Read(buf)
-		if err != nil || n != Sector {
-			break
+		if _, err := io.ReadFull(sr, buf); err != nil {
+			return nil, xerrors.Errorf("failed to read EBR at sector %d: %w", ebrSector, err)
 		}
 
 		sig := binary.LittleEndian.Uint16(buf[510:512])
@@ -296,5 +302,5 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) []Partition {
 		ebrSector = extStartSector + entry1.StartSector
 	}
 
-	return partitions
+	return partitions, nil
 }
