@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"math"
 	"strconv"
 
 	"github.com/masahiro331/go-disk/types"
@@ -152,11 +151,7 @@ func (p Partition) newSectionReader(r io.ReaderAt) *io.SectionReader {
 // It reads from sr only with ReadAt, so sr is not required to keep a read offset.
 func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 	buf := make([]byte, Sector)
-	size, err := sr.ReadAt(buf, 0)
-	if size != Sector {
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
+	if err := readSector(sr, buf, 0); err != nil {
 		return nil, xerrors.Errorf("failed to read mbr error: %w", err)
 	}
 
@@ -213,8 +208,7 @@ func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 		if mbr.Partitions[i].Type != 0x05 && mbr.Partitions[i].Type != 0x0f {
 			continue
 		}
-		// parseEBRChain seeks the reader it is given, so give it one of its own.
-		logicals, err := parseEBRChain(io.NewSectionReader(sr, 0, math.MaxInt64), mbr.Partitions[i].StartSector)
+		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse extended partition %d: %w", i, err)
 		}
@@ -275,11 +269,11 @@ func parsePartitionEntry(buf []byte) Partition {
 //   - Entry 0: logical partition (StartSector relative to this EBR)
 //   - Entry 1: next EBR pointer (StartSector relative to extStartSector)
 //
-// I/O failures (seek/read/short read) are returned as errors so the
+// I/O failures (read/short read) are returned as errors so the
 // caller can distinguish a malformed/truncated image from a legitimate
 // "no EBR" case (signature mismatch), which terminates the chain
 // without an error and lets the caller apply a fallback.
-func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, error) {
+func parseEBRChain(sr io.ReaderAt, extStartSector uint32) ([]Partition, error) {
 	var partitions []Partition
 	ebrSector := extStartSector
 	visited := make(map[uint32]bool)
@@ -292,11 +286,7 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, er
 		visited[ebrSector] = true
 
 		ebrOffset := int64(ebrSector) * Sector
-		if _, err := sr.Seek(ebrOffset, 0); err != nil {
-			return nil, xerrors.Errorf("failed to seek EBR at sector %d: %w", ebrSector, err)
-		}
-
-		if _, err := io.ReadFull(sr, buf); err != nil {
+		if err := readSector(sr, buf, ebrOffset); err != nil {
 			return nil, xerrors.Errorf("failed to read EBR at sector %d: %w", ebrSector, err)
 		}
 
@@ -321,4 +311,16 @@ func parseEBRChain(sr *io.SectionReader, extStartSector uint32) ([]Partition, er
 	}
 
 	return partitions, nil
+}
+
+// readSector reads len(b) bytes at off. A full read that also reports io.EOF is treated as success.
+func readSector(r io.ReaderAt, b []byte, off int64) error {
+	n, err := r.ReadAt(b, off)
+	if n == len(b) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return xerrors.Errorf("invalid read size: actual(%d), expected(%d): %w", n, len(b), err)
 }

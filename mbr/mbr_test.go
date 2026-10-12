@@ -407,6 +407,22 @@ func TestMasterBootRecord_Next_ExtendedInvalidEBR(t *testing.T) {
 	}
 }
 
+func TestNewMasterBootRecord_ExtendedTruncatedEBR(t *testing.T) {
+	// Extended partition points past the end of the disk, so reading the EBR
+	// is a short read and must be reported as an error.
+	diskSize := 30 * 512
+	buf := make([]byte, diskSize)
+
+	writePartitionEntry(buf[446:], true, 0x83, 2, 4)    // partition 0: primary
+	writePartitionEntry(buf[462:], false, 0x05, 40, 20) // partition 1: extended beyond disk end
+	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
+
+	sr := io.NewSectionReader(newReaderAt(buf), 0, int64(len(buf)))
+	if _, err := mbr.NewMasterBootRecord(sr); err == nil {
+		t.Fatal("NewMasterBootRecord() expected error for truncated EBR, got nil")
+	}
+}
+
 func TestMasterBootRecord_Next_ExtendedCircularReference(t *testing.T) {
 	// EBR chain with circular reference: EBR 1 points to itself.
 	diskSize := 30 * 512
