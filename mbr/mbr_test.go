@@ -693,7 +693,7 @@ func TestPartition_ConcurrentReadAt_Logical(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Next() unexpected error: %v", err)
 		}
-		if t := p.GetType()[0]; p.GetSize() > 0 && t != 0x05 && t != 0x0f {
+		if t := p.GetType()[0]; p.GetSize() > 0 && t != 0x05 && t != 0x0f && t != 0x85 {
 			partitions = append(partitions, p)
 		}
 	}
