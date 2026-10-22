@@ -164,19 +164,25 @@ func TestGUIDPartitionTable_Next(t *testing.T) {
 //	entry[0] LBA 10-17
 //	entry[1] LBA 18-29
 func newPatternedGPTDisk() []byte {
-	buf := make([]byte, 32*Sector)
-	for i := 3 * Sector; i < len(buf); i++ {
+	return newPatternedGPTDiskWithSectorSize(Sector)
+}
+
+// newPatternedGPTDiskWithSectorSize is newPatternedGPTDisk with sectorSize-byte logical blocks.
+func newPatternedGPTDiskWithSectorSize(sectorSize int) []byte {
+	buf := make([]byte, 32*sectorSize)
+	for i := 3 * sectorSize; i < len(buf); i++ {
 		buf[i] = byte(i % 251)
 	}
 
-	header := buf[Sector : 2*Sector]
+	header := buf[sectorSize : 2*sectorSize]
 	copy(header[0:8], Signature)
 	binary.LittleEndian.PutUint32(header[12:], 92)  // HeaderSize
+	binary.LittleEndian.PutUint64(header[24:], 1)   // MyLBA
 	binary.LittleEndian.PutUint64(header[72:], 2)   // PartitionEntryLBA
 	binary.LittleEndian.PutUint32(header[80:], 4)   // NumberOfPartitionEntries
 	binary.LittleEndian.PutUint32(header[84:], 128) // SizeOfPartitionEntry
 
-	entries := buf[2*Sector : 3*Sector]
+	entries := buf[2*sectorSize : 3*sectorSize]
 	for i, lba := range [][2]uint64{{10, 17}, {18, 29}} {
 		e := entries[i*PartitionEntrySize:]
 		e[0] = 0x01 // PartitionTypeGUID, non-zero to mark the entry as used
@@ -504,5 +510,145 @@ func TestNewGUIDPartitionTable_NotGPT(t *testing.T) {
 	_, err := NewGUIDPartitionTable(bytes.NewReader(make([]byte, 4*Sector)))
 	if err == nil || !strings.Contains(err.Error(), "invalid GPT signature") {
 		t.Errorf("NewGUIDPartitionTable() error = %v, want an invalid GPT signature error", err)
+	}
+}
+
+func TestNewGUIDPartitionTableWithSectorSize(t *testing.T) {
+	disk4K := newPatternedGPTDiskWithSectorSize(4096)
+	diskMyLBA0 := newPatternedGPTDisk()
+	binary.LittleEndian.PutUint64(diskMyLBA0[Sector+24:], 0)
+	// A backup header or stale data has the signature with MyLBA other than 1.
+	withStaleHeader := func(disk []byte, off int) []byte {
+		disk = append([]byte(nil), disk...)
+		copy(disk[off:], Signature)
+		binary.LittleEndian.PutUint64(disk[off+24:], 100) // MyLBA
+		return disk
+	}
+
+	tests := []struct {
+		name           string
+		disk           []byte
+		sectorSize     int
+		wantSectorSize int
+		wantErr        string
+	}{
+		{name: "4096", disk: disk4K, sectorSize: 4096, wantSectorSize: 4096},
+		{name: "detect 512", disk: newPatternedGPTDisk(), sectorSize: 0, wantSectorSize: 512},
+		// Detection falls back to 512, which still parses a 512 header that detection does not accept.
+		{name: "detect 512 with MyLBA 0", disk: diskMyLBA0, sectorSize: 0, wantSectorSize: 512},
+		{name: "detect 4096", disk: disk4K, sectorSize: 0, wantSectorSize: 4096},
+		{name: "detect 4096 next to a stale header at 512", disk: withStaleHeader(disk4K, 512), sectorSize: 0, wantSectorSize: 4096},
+		{name: "4096 read with 512", disk: disk4K, sectorSize: 512, wantErr: "invalid GPT signature"},
+		// Neither header has MyLBA 1, so detection falls back to 512.
+		{name: "detect with a stale header at 4096", disk: withStaleHeader(make([]byte, 32*4096), 4096), sectorSize: 0, wantErr: "invalid GPT signature"},
+		{name: "unsupported", disk: disk4K, sectorSize: 1024, wantErr: "unsupported sector size"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, err := NewGUIDPartitionTableWithSectorSize(bytes.NewReader(tt.disk), tt.sectorSize)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("NewGUIDPartitionTableWithSectorSize() error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewGUIDPartitionTableWithSectorSize() unexpected error: %v", err)
+			}
+			if len(g.Entries) != 2 {
+				t.Fatalf("got %d entries, want 2", len(g.Entries))
+			}
+			for _, pe := range g.Entries {
+				if got := pe.SectorSize(); got != tt.wantSectorSize {
+					t.Errorf("entry %d: SectorSize() = %d, want %d", pe.Index(), got, tt.wantSectorSize)
+				}
+				start := int64(pe.GetStartSector()) * int64(tt.wantSectorSize)
+				verifyRandomPartitionReadAt(t, pe, tt.disk[start:start+int64(pe.GetSize())*int64(tt.wantSectorSize)], 0)
+			}
+		})
+	}
+}
+
+func TestNewGUIDPartitionTableWithSectorSize_HeaderSize(t *testing.T) {
+	tests := []struct {
+		size    uint32
+		wantErr bool
+	}{
+		{size: 91, wantErr: true},
+		{size: 92, wantErr: false},
+		{size: 4096, wantErr: false},
+		{size: 4097, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.FormatUint(uint64(tt.size), 10), func(t *testing.T) {
+			disk := newPatternedGPTDiskWithSectorSize(4096)
+			binary.LittleEndian.PutUint32(disk[4096+12:], tt.size) // HeaderSize
+			if _, err := NewGUIDPartitionTableWithSectorSize(bytes.NewReader(disk), 4096); (err != nil) != tt.wantErr {
+				t.Fatalf("NewGUIDPartitionTableWithSectorSize() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewGUIDPartitionTableWithSectorSize_PartitionEntryLBA(t *testing.T) {
+	// The entry array of 4 entries is one 4096-byte block.
+	maxLBA := uint64(math.MaxInt64-4096) / 4096
+	tests := []struct {
+		name      string
+		lba       uint64
+		wantReads int
+	}{
+		// Within int64, so the array is read and the read fails past the end of the disk.
+		{name: "end at the int64 limit", lba: maxLBA, wantReads: 2},
+		{name: "end past the int64 limit", lba: maxLBA + 1, wantReads: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			disk := newPatternedGPTDiskWithSectorSize(4096)
+			binary.LittleEndian.PutUint64(disk[4096+72:], tt.lba) // PartitionEntryLBA
+			r := &countingReaderAt{r: bytes.NewReader(disk)}
+			if _, err := NewGUIDPartitionTableWithSectorSize(r, 4096); err == nil {
+				t.Fatal("NewGUIDPartitionTableWithSectorSize() expected error, got nil")
+			}
+			if r.reads != tt.wantReads {
+				t.Errorf("ReadAt called %d times, want %d", r.reads, tt.wantReads)
+			}
+		})
+	}
+}
+
+func TestPartitionEntry_SectorSizeDefault(t *testing.T) {
+	// Entries constructed without NewGUIDPartitionTable have 512-byte sectors.
+	pe := PartitionEntry{StartingLBA: 10, EndingLBA: 17}
+	if got := pe.SectorSize(); got != Sector {
+		t.Errorf("SectorSize() = %d, want %d", got, Sector)
+	}
+
+	// An entry set on a parsed table takes the table's sector size when Next gives it a reader.
+	disk := newPatternedGPTDiskWithSectorSize(4096)
+	g, err := NewGUIDPartitionTableWithSectorSize(bytes.NewReader(disk), 4096)
+	if err != nil {
+		t.Fatalf("NewGUIDPartitionTableWithSectorSize() unexpected error: %v", err)
+	}
+	g.Entries[0] = PartitionEntry{PartitionTypeGUID: GUID{0x01}, StartingLBA: 10, EndingLBA: 17}
+	p, err := g.Next()
+	if err != nil {
+		t.Fatalf("Next() unexpected error: %v", err)
+	}
+	verifyRandomPartitionReadAt(t, p, disk[10*4096:18*4096], 0)
+
+	// The int64 limit of the end offset depends on the sector size.
+	const maxEndingLBA = math.MaxInt64/4096 - 1
+	for _, tt := range []struct {
+		endingLBA uint64
+		wantSize  uint64
+	}{
+		{endingLBA: maxEndingLBA, wantSize: 1},
+		{endingLBA: maxEndingLBA + 1, wantSize: 0},
+	} {
+		pe := PartitionEntry{StartingLBA: tt.endingLBA, EndingLBA: tt.endingLBA, sectorSize: 4096}
+		if got := pe.GetSize(); got != tt.wantSize {
+			t.Errorf("EndingLBA %d: GetSize() = %d, want %d", tt.endingLBA, got, tt.wantSize)
+		}
 	}
 }

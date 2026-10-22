@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	// Sector is the logical block size. Disks with 4096-byte logical blocks (4Kn) are not supported.
+	// Sector is the default logical block size, used by NewGUIDPartitionTable.
 	Sector    = 0x200
 	Signature = "EFI PART"
 	// PartitionEntrySize is the only entry size accepted. The UEFI spec allows 128 * 2^n, but Linux also accepts only 128.
@@ -24,6 +24,8 @@ const (
 
 	// maxPartitionEntryArraySize is the largest entry array Linux accepts on x86_64 (KMALLOC_MAX_SIZE).
 	maxPartitionEntryArraySize = 4 << 20
+	// minHeaderSize is the size of the defined header fields.
+	minHeaderSize = 92
 )
 
 const (
@@ -80,6 +82,8 @@ type GUIDPartitionTable struct {
 
 	nextIndex     int
 	sectionReader io.ReaderAt
+	// sectorSize is passed to entries that Next gives a reader. 0 means Sector.
+	sectorSize int
 }
 
 // Next returns the next used partition entry.
@@ -94,6 +98,9 @@ func (gpt *GUIDPartitionTable) Next() (types.Partition, error) {
 	if entry.sectionReader == nil {
 		// Entries built by NewGUIDPartitionTable already have a reader.
 		// This covers tables constructed without it.
+		if entry.sectorSize == 0 {
+			entry.sectorSize = gpt.sectorSize
+		}
 		entry.sectionReader = entry.newSectionReader(gpt.sectionReader)
 	}
 
@@ -136,10 +143,18 @@ func (pe PartitionEntry) GetStartSector() uint64 {
 
 // GetSize returns the size in sectors, or 0 if the entry's range is invalid.
 func (pe PartitionEntry) GetSize() uint64 {
-	if pe.EndingLBA < pe.StartingLBA || pe.EndingLBA >= math.MaxInt64/Sector {
+	if pe.EndingLBA < pe.StartingLBA || pe.EndingLBA >= math.MaxInt64/uint64(pe.SectorSize()) {
 		return 0
 	}
 	return pe.EndingLBA - pe.StartingLBA + 1
+}
+
+// SectorSize returns the logical block size in bytes, which GetStartSector and GetSize are in.
+func (pe PartitionEntry) SectorSize() int {
+	if pe.sectorSize == 0 {
+		return Sector
+	}
+	return pe.sectorSize
 }
 
 func (pe PartitionEntry) GetType() []byte {
@@ -166,7 +181,8 @@ func (pe PartitionEntry) GetSectionReader() io.SectionReader {
 }
 
 func (pe PartitionEntry) newSectionReader(r io.ReaderAt) *io.SectionReader {
-	return io.NewSectionReader(r, int64(pe.GetStartSector())*Sector, int64(pe.GetSize()*Sector))
+	sectorSize := int64(pe.SectorSize())
+	return io.NewSectionReader(r, int64(pe.GetStartSector())*sectorSize, int64(pe.GetSize())*sectorSize)
 }
 
 type Header struct {
@@ -196,6 +212,8 @@ type PartitionEntry struct {
 	PartitionName       [36]uint16 // UTF-16 encoded
 
 	index int
+	// sectorSize is the logical block size of StartingLBA and EndingLBA. 0 means Sector.
+	sectorSize int
 
 	sectionReader *io.SectionReader
 }
@@ -224,12 +242,31 @@ func (g *PartitionEntry) isUsed() bool {
 	return false
 }
 
-// NewGUIDPartitionTable parses the GPT header at LBA 1 and the partition entry array at its PartitionEntryLBA.
+// NewGUIDPartitionTable parses the GPT header at LBA 1 and the partition entry array at its PartitionEntryLBA,
+// with 512-byte sectors.
 // It reads from r only with ReadAt, so r is not required to keep a read offset.
 func NewGUIDPartitionTable(r io.ReaderAt) (*GUIDPartitionTable, error) {
-	gpt := GUIDPartitionTable{sectionReader: r}
-	header := make([]byte, Sector)
-	if err := readSector(r, header, Sector); err != nil {
+	return NewGUIDPartitionTableWithSectorSize(r, Sector)
+}
+
+// NewGUIDPartitionTableWithSectorSize is NewGUIDPartitionTable for a disk with the given logical block size,
+// which must be 512 or 4096, or 0 to detect it.
+//
+// Detection takes the first of 512 and 4096 whose LBA 1 holds a header with the GPT signature and MyLBA 1,
+// and falls back to 512. Linux does not detect the size but takes it from the block device;
+// a disk image has no block device to take it from.
+func NewGUIDPartitionTableWithSectorSize(r io.ReaderAt, sectorSize int) (*GUIDPartitionTable, error) {
+	switch sectorSize {
+	case 0:
+		sectorSize = detectSectorSize(r)
+	case Sector, 4096:
+	default:
+		return nil, xerrors.Errorf("unsupported sector size: %d", sectorSize)
+	}
+
+	gpt := GUIDPartitionTable{sectionReader: r, sectorSize: sectorSize}
+	header := make([]byte, sectorSize)
+	if err := readSector(r, header, int64(sectorSize)); err != nil {
 		return nil, xerrors.Errorf("failed to read header: %w", err)
 	}
 	if err := binary.Read(bytes.NewReader(header), binary.LittleEndian, &gpt.Header); err != nil {
@@ -244,24 +281,24 @@ func NewGUIDPartitionTable(r io.ReaderAt) (*GUIDPartitionTable, error) {
 		return nil, xerrors.Errorf("not support GPT format error: actual(%d byte), expected(%d byte)", gpt.Header.SizeOfPartitionEntry, PartitionEntrySize)
 	}
 
-	// Bytes past the defined fields are reserved, so a larger header up to a sector is valid.
-	minHeaderSize := Sector - len(gpt.Header.ReservedPadding)
-	if int(gpt.Header.HeaderSize) < minHeaderSize || gpt.Header.HeaderSize > Sector {
-		return nil, xerrors.Errorf("invalid header size error: actual(%d), expected(%d-%d)", gpt.Header.HeaderSize, minHeaderSize, Sector)
+	// Bytes past the defined fields are reserved, so a larger header up to a logical block is valid.
+	if gpt.Header.HeaderSize < minHeaderSize || gpt.Header.HeaderSize > uint32(sectorSize) {
+		return nil, xerrors.Errorf("invalid header size error: actual(%d), expected(%d-%d)", gpt.Header.HeaderSize, minHeaderSize, sectorSize)
 	}
 
 	size := uint64(gpt.Header.NumberOfPartitionEntries) * uint64(gpt.Header.SizeOfPartitionEntry)
 	if size > maxPartitionEntryArraySize {
 		return nil, xerrors.Errorf("partition entry array too large: actual(%d byte), max(%d byte)", size, maxPartitionEntryArraySize)
 	}
-	arrayLen := (size + Sector - 1) / Sector * Sector
+	blockSize := uint64(sectorSize)
+	arrayLen := (size + blockSize - 1) / blockSize * blockSize
 	// The array follows the header at LBA 1, and must end within int64 byte offsets.
 	lba := gpt.Header.PartitionEntryLBA
-	if lba < 2 || lba > (math.MaxInt64-arrayLen)/Sector {
+	if lba < 2 || lba > (math.MaxInt64-arrayLen)/blockSize {
 		return nil, xerrors.Errorf("invalid partition entry LBA: %d", lba)
 	}
 	array := make([]byte, arrayLen)
-	if err := readSector(r, array, int64(lba)*Sector); err != nil {
+	if err := readSector(r, array, int64(lba)*int64(sectorSize)); err != nil {
 		return nil, xerrors.Errorf("failed to read partition entry array: %w", err)
 	}
 	buf := bytes.NewReader(array)
@@ -287,6 +324,7 @@ func NewGUIDPartitionTable(r io.ReaderAt) (*GUIDPartitionTable, error) {
 			return nil, xerrors.Errorf("failed to parse GPT partition entry[%d] PartitionName: %w", i, err)
 		}
 		partitionEntry.index = i
+		partitionEntry.sectorSize = sectorSize
 
 		if partitionEntry.isUsed() {
 			partitionEntry.sectionReader = partitionEntry.newSectionReader(r)
@@ -299,6 +337,18 @@ func NewGUIDPartitionTable(r io.ReaderAt) (*GUIDPartitionTable, error) {
 
 func (pe PartitionEntry) IsSupported() bool {
 	return true
+}
+
+// detectSectorSize checks MyLBA, because the primary header has MyLBA 1, which tells it from a backup header
+// or stale data at the other offset.
+func detectSectorSize(r io.ReaderAt) int {
+	b := make([]byte, 32) // up to MyLBA
+	for _, sectorSize := range []int{Sector, 4096} {
+		if readSector(r, b, int64(sectorSize)) == nil && string(b[:8]) == Signature && binary.LittleEndian.Uint64(b[24:]) == 1 {
+			return sectorSize
+		}
+	}
+	return Sector
 }
 
 // readSector reads len(b) bytes at off. A full read that also reports io.EOF is treated as success.
