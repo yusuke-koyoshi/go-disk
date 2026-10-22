@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -709,8 +710,10 @@ func TestPartition_ReadAtBounds(t *testing.T) {
 //	[1] extended StartSector=10, Size=40
 //	    EBR at 10: logical StartSector=11, Size=5, next EBR at 20
 //	    EBR at 20: logical StartSector=21, Size=5
-func newPatternedExtendedMBRDisk() []byte {
-	buf := make([]byte, 50*mbr.Sector)
+//
+// Sectors are sectorSize bytes, and each EBR is the 512-byte record at the start of its sector.
+func newPatternedExtendedMBRDisk(sectorSize int) []byte {
+	buf := make([]byte, 50*sectorSize)
 	for i := mbr.Sector; i < len(buf); i++ {
 		buf[i] = byte(i % 251)
 	}
@@ -718,61 +721,124 @@ func newPatternedExtendedMBRDisk() []byte {
 	writePartitionEntry(buf[462:], false, 0x05, 10, 40)
 	binary.LittleEndian.PutUint16(buf[510:], 0xAA55)
 
-	ebr1 := buf[10*mbr.Sector : 11*mbr.Sector]
-	copy(ebr1, make([]byte, mbr.Sector))
+	ebr1 := buf[10*sectorSize : 11*sectorSize]
+	copy(ebr1, make([]byte, sectorSize))
 	writePartitionEntry(ebr1[446:], false, 0x83, 1, 5)
 	writePartitionEntry(ebr1[462:], false, 0x05, 10, 16)
 	binary.LittleEndian.PutUint16(ebr1[510:], 0xAA55)
 
-	ebr2 := buf[20*mbr.Sector : 21*mbr.Sector]
-	copy(ebr2, make([]byte, mbr.Sector))
+	ebr2 := buf[20*sectorSize : 21*sectorSize]
+	copy(ebr2, make([]byte, sectorSize))
 	writePartitionEntry(ebr2[446:], false, 0x83, 1, 5)
 	binary.LittleEndian.PutUint16(ebr2[510:], 0xAA55)
 	return buf
 }
 
 func TestPartition_ConcurrentReadAt_Logical(t *testing.T) {
-	disk := newPatternedExtendedMBRDisk()
-	m, err := mbr.NewMasterBootRecord(newReaderAt(disk))
+	for _, sectorSize := range []int{512, 4096} {
+		t.Run(strconv.Itoa(sectorSize), func(t *testing.T) {
+			disk := newPatternedExtendedMBRDisk(sectorSize)
+			m, err := mbr.NewMasterBootRecordWithSectorSize(newReaderAt(disk), sectorSize)
+			if err != nil {
+				t.Fatalf("NewMasterBootRecordWithSectorSize() unexpected error: %v", err)
+			}
+
+			// Iterate to the end first, so that every partition is read after Next() has moved past it.
+			var partitions []types.Partition
+			for {
+				p, err := m.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("Next() unexpected error: %v", err)
+				}
+				if t := p.GetType()[0]; p.GetSize() > 0 && t != 0x05 && t != 0x0f && t != 0x85 {
+					partitions = append(partitions, p)
+				}
+			}
+			var starts []uint64
+			for _, p := range partitions {
+				starts = append(starts, p.GetStartSector())
+				if got := p.(*mbr.Partition).SectorSize(); got != sectorSize {
+					t.Errorf("SectorSize() = %d, want %d", got, sectorSize)
+				}
+			}
+			if want := []uint64{2, 11, 21}; !reflect.DeepEqual(starts, want) {
+				t.Fatalf("start sectors = %v, want %v", starts, want)
+			}
+
+			var wg sync.WaitGroup
+			for _, p := range partitions {
+				start := int64(p.GetStartSector()) * int64(sectorSize)
+				want := disk[start : start+int64(p.GetSize())*int64(sectorSize)]
+				for g := 0; g < 8; g++ {
+					wg.Add(1)
+					go func(p types.Partition, seed int64) {
+						defer wg.Done()
+						verifyRandomReadAt(t, p, want, seed)
+					}(p, int64(g))
+				}
+			}
+			wg.Wait()
+		})
+	}
+}
+
+func TestNewMasterBootRecordWithSectorSize_Unsupported(t *testing.T) {
+	disk := newPatternedExtendedMBRDisk(512)
+	for _, sectorSize := range []int{0, 1024, 8192} {
+		if _, err := mbr.NewMasterBootRecordWithSectorSize(newReaderAt(disk), sectorSize); err == nil {
+			t.Errorf("sector size %d: expected an error", sectorSize)
+		}
+	}
+}
+
+func TestPartition_SectorSizeDefault(t *testing.T) {
+	// Partitions constructed without NewMasterBootRecord have 512-byte sectors.
+	p := mbr.Partition{Type: 0x83, StartSector: 2, Size: 4}
+	if got := p.SectorSize(); got != mbr.Sector {
+		t.Errorf("SectorSize() = %d, want %d", got, mbr.Sector)
+	}
+
+	// A partition set on a parsed record takes the record's sector size when Next gives it a reader.
+	disk := newPatternedExtendedMBRDisk(4096)
+	m, err := mbr.NewMasterBootRecordWithSectorSize(newReaderAt(disk), 4096)
 	if err != nil {
-		t.Fatalf("NewMasterBootRecord() unexpected error: %v", err)
+		t.Fatalf("NewMasterBootRecordWithSectorSize() unexpected error: %v", err)
 	}
+	m.Partitions[0] = mbr.Partition{Type: 0x83, StartSector: 2, Size: 4}
+	got, err := m.Next()
+	if err != nil {
+		t.Fatalf("Next() unexpected error: %v", err)
+	}
+	verifyRandomReadAt(t, got, disk[2*4096:6*4096], 0)
+}
 
-	// Iterate to the end first, so that every partition is read after Next() has moved past it.
-	var partitions []types.Partition
-	for {
-		p, err := m.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Next() unexpected error: %v", err)
-		}
-		if t := p.GetType()[0]; p.GetSize() > 0 && t != 0x05 && t != 0x0f && t != 0x85 {
-			partitions = append(partitions, p)
-		}
+func TestNewMasterBootRecordWithSectorSize_ExtendedWithoutEBR(t *testing.T) {
+	// The fallback for an extended partition without an EBR skips the amount Linux exposes for it: one 4096-byte logical block.
+	const sectorSize = 4096
+	disk := make([]byte, 30*sectorSize)
+	for i := mbr.Sector; i < len(disk); i++ {
+		disk[i] = byte(i % 251)
 	}
-	var starts []uint64
-	for _, p := range partitions {
-		starts = append(starts, p.GetStartSector())
-	}
-	if want := []uint64{2, 11, 21}; !reflect.DeepEqual(starts, want) {
-		t.Fatalf("start sectors = %v, want %v", starts, want)
-	}
+	writePartitionEntry(disk[446:], false, 0x05, 10, 20)
+	binary.LittleEndian.PutUint16(disk[510:], 0xAA55)
+	// The first 512 bytes of sector 10 have no EBR signature.
+	copy(disk[10*sectorSize:], make([]byte, mbr.Sector))
 
-	var wg sync.WaitGroup
-	for _, p := range partitions {
-		start := int64(p.GetStartSector()) * mbr.Sector
-		want := disk[start : start+int64(p.GetSize())*mbr.Sector]
-		for g := 0; g < 8; g++ {
-			wg.Add(1)
-			go func(p types.Partition, seed int64) {
-				defer wg.Done()
-				verifyRandomReadAt(t, p, want, seed)
-			}(p, int64(g))
-		}
+	m, err := mbr.NewMasterBootRecordWithSectorSize(newReaderAt(disk), sectorSize)
+	if err != nil {
+		t.Fatalf("NewMasterBootRecordWithSectorSize() unexpected error: %v", err)
 	}
-	wg.Wait()
+	p, err := m.Next()
+	if err != nil {
+		t.Fatalf("Next() unexpected error: %v", err)
+	}
+	if p.GetStartSector() != 11 || p.GetSize() != 19 {
+		t.Fatalf("start, size = %d, %d, want 11, 19", p.GetStartSector(), p.GetSize())
+	}
+	verifyRandomReadAt(t, p, disk[11*sectorSize:30*sectorSize], 0)
 }
 
 // verifyRandomReadAt reads p at random offsets, including reads across its end, and compares with want.

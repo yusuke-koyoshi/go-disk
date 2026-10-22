@@ -13,9 +13,12 @@ import (
 
 const (
 	SIGNATURE = 0xAA55
-	// Sector is the logical block size. Disks with 4096-byte logical blocks (4Kn) are not supported.
+	// Sector is the default logical block size, used by NewMasterBootRecord.
 	Sector           = 512
 	maxEBRChainDepth = 256
+
+	// recordSize is the size of an MBR or EBR, which is 512 bytes whatever the logical block size.
+	recordSize = 512
 )
 
 /*
@@ -65,6 +68,8 @@ type MasterBootRecord struct {
 	logicalPartitions []Partition
 	nextIndex         int
 	sectionReader     io.ReaderAt
+	// sectorSize is passed to partitions that Next gives a reader. 0 means Sector.
+	sectorSize int
 }
 
 type CHS [3]byte
@@ -78,6 +83,8 @@ type Partition struct {
 	StartSector uint32
 	Size        uint32
 	index       int
+	// sectorSize is the logical block size of StartSector and Size. 0 means Sector.
+	sectorSize int
 
 	sectionReader *io.SectionReader
 }
@@ -100,6 +107,9 @@ func (m *MasterBootRecord) Next() (types.Partition, error) {
 	if partition.sectionReader == nil {
 		// Partitions built by NewMasterBootRecord already have a reader.
 		// This covers records constructed without it.
+		if partition.sectorSize == 0 {
+			partition.sectorSize = m.sectorSize
+		}
 		partition.sectionReader = partition.newSectionReader(m.sectionReader)
 	}
 
@@ -132,6 +142,14 @@ func (p Partition) GetSize() uint64 {
 	return uint64(p.Size)
 }
 
+// SectorSize returns the logical block size in bytes, which GetStartSector and GetSize are in.
+func (p Partition) SectorSize() int {
+	if p.sectorSize == 0 {
+		return Sector
+	}
+	return p.sectorSize
+}
+
 // ReadAt reads from the partition. Reads are bounded to the partition range.
 // It is safe for concurrent use if the underlying disk reader is.
 func (p Partition) ReadAt(b []byte, off int64) (int, error) {
@@ -145,15 +163,27 @@ func (p Partition) GetSectionReader() io.SectionReader {
 }
 
 func (p Partition) newSectionReader(r io.ReaderAt) *io.SectionReader {
-	return io.NewSectionReader(r, int64(p.GetStartSector())*Sector, int64(p.GetSize()*Sector))
+	sectorSize := int64(p.SectorSize())
+	return io.NewSectionReader(r, int64(p.GetStartSector())*sectorSize, int64(p.GetSize())*sectorSize)
 }
 
-// NewMasterBootRecord parses the master boot record in the first sector of sr.
+// NewMasterBootRecord parses the master boot record in the first sector of sr, with 512-byte sectors.
 // It reads from sr only with ReadAt, so sr is not required to keep a read offset.
 func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
-	buf := make([]byte, Sector)
+	return NewMasterBootRecordWithSectorSize(sr, Sector)
+}
+
+// NewMasterBootRecordWithSectorSize is NewMasterBootRecord for a disk with the given logical block size,
+// which must be 512 or 4096.
+// The MBR does not record the logical block size, so it cannot be detected from the disk.
+func NewMasterBootRecordWithSectorSize(sr io.ReaderAt, sectorSize int) (*MasterBootRecord, error) {
+	if sectorSize != Sector && sectorSize != 4096 {
+		return nil, xerrors.Errorf("unsupported sector size: %d", sectorSize)
+	}
+
+	buf := make([]byte, recordSize)
 	size, err := sr.ReadAt(buf, 0)
-	if size != Sector {
+	if size != recordSize {
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
@@ -161,7 +191,7 @@ func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 	}
 
 	r := bytes.NewReader(buf)
-	mbr := MasterBootRecord{sectionReader: sr}
+	mbr := MasterBootRecord{sectionReader: sr, sectorSize: sectorSize}
 
 	if err := binary.Read(r, binary.LittleEndian, &mbr.BootCodeArea); err != nil {
 		return nil, xerrors.Errorf("failed to parse boot code: %w", err)
@@ -195,6 +225,7 @@ func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 			return nil, xerrors.Errorf("failed to parse partition[%d] Size: %w", i, err)
 		}
 		mbr.Partitions[i].index = i
+		mbr.Partitions[i].sectorSize = sectorSize
 	}
 
 	if err := binary.Read(r, binary.LittleEndian, &mbr.Signature); err != nil {
@@ -213,7 +244,7 @@ func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 		if !isExtended(mbr.Partitions[i].Type) {
 			continue
 		}
-		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector)
+		logicals, err := parseEBRChain(sr, mbr.Partitions[i].StartSector, sectorSize)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse extended partition %d: %w", i, err)
 		}
@@ -221,9 +252,14 @@ func NewMasterBootRecord(sr io.ReaderAt) (*MasterBootRecord, error) {
 			mbr.logicalPartitions = append(mbr.logicalPartitions, logicals...)
 		} else {
 			// No logical partition found; adjust partition to skip past the EBR area.
-			if mbr.Partitions[i].Size > 2 && mbr.Partitions[i].StartSector <= math.MaxUint32-2 {
-				mbr.Partitions[i].StartSector += 2
-				mbr.Partitions[i].Size -= 2
+			// Linux exposes only the first 1024 bytes of it, or one logical block if that is larger; skip the same amount.
+			reserved := uint32(2)
+			if sectorSize > 512 {
+				reserved = 1
+			}
+			if mbr.Partitions[i].Size > reserved && mbr.Partitions[i].StartSector <= math.MaxUint32-reserved {
+				mbr.Partitions[i].StartSector += reserved
+				mbr.Partitions[i].Size -= reserved
 			} else {
 				mbr.Partitions[i].Size = 0
 			}
@@ -277,7 +313,7 @@ func parsePartitionEntry(buf []byte) Partition {
 
 // parseEBRChain traverses the Extended Boot Record chain starting at
 // extStartSector and returns all logical partitions found.
-// Each EBR has the same 512-byte structure as an MBR:
+// Each EBR has the same 512-byte structure as an MBR, at the start of its sector:
 //   - Entry 0: logical partition (StartSector relative to this EBR)
 //   - Entry 1: next EBR pointer (StartSector relative to extStartSector)
 //
@@ -285,11 +321,11 @@ func parsePartitionEntry(buf []byte) Partition {
 // caller can distinguish a malformed/truncated image from a legitimate
 // "no EBR" case (signature mismatch), which terminates the chain
 // without an error and lets the caller apply a fallback.
-func parseEBRChain(sr io.ReaderAt, extStartSector uint32) ([]Partition, error) {
+func parseEBRChain(sr io.ReaderAt, extStartSector uint32, sectorSize int) ([]Partition, error) {
 	var partitions []Partition
 	ebrSector := extStartSector
 	visited := make(map[uint32]bool)
-	buf := make([]byte, Sector)
+	buf := make([]byte, recordSize)
 
 	for hops := 0; hops < maxEBRChainDepth; hops++ {
 		if visited[ebrSector] {
@@ -297,8 +333,8 @@ func parseEBRChain(sr io.ReaderAt, extStartSector uint32) ([]Partition, error) {
 		}
 		visited[ebrSector] = true
 
-		ebrOffset := int64(ebrSector) * Sector
-		if n, err := sr.ReadAt(buf, ebrOffset); n != Sector {
+		ebrOffset := int64(ebrSector) * int64(sectorSize)
+		if n, err := sr.ReadAt(buf, ebrOffset); n != recordSize {
 			if err == nil || err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
@@ -316,6 +352,7 @@ func parseEBRChain(sr io.ReaderAt, extStartSector uint32) ([]Partition, error) {
 		entry0 := parsePartitionEntry(buf[446:462])
 		if entry0.Type != 0 && entry0.Size != 0 && !isExtended(entry0.Type) && entry0.StartSector <= math.MaxUint32-ebrSector {
 			entry0.StartSector += ebrSector
+			entry0.sectorSize = sectorSize
 			partitions = append(partitions, entry0)
 		}
 
