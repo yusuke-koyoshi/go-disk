@@ -14,8 +14,27 @@ import (
 // The disk is GPT if any MBR entry has type 0xEE, and MBR otherwise. Linux also ignores MBR partitions in that case.
 // r is read only with ReadAt, and partitions returned by the driver can be read concurrently
 // if r supports concurrent ReadAt calls. *io.SectionReader satisfies io.ReaderAt.
+//
+// The logical block size is detected for GPT, as described in gpt.NewGUIDPartitionTableWithSectorSize,
+// and is 512 bytes for MBR. An MBR disk with 4096-byte logical blocks needs NewDriverWithSectorSize,
+// and so does a 4096-byte block disk that keeps a GPT header for 512-byte sectors at offset 512.
 func NewDriver(r io.ReaderAt, checkFsFuncs ...fs.CheckFsFunc) (types.Driver, error) {
-	m, err := mbr.NewMasterBootRecord(r)
+	return NewDriverWithSectorSize(r, 0, checkFsFuncs...)
+}
+
+// NewDriverWithSectorSize is NewDriver for a disk with the given logical block size, which must be 512 or 4096,
+// or 0 to detect it as NewDriver does. Use it when the size is known, e.g. from the cloud disk the image was taken from.
+func NewDriverWithSectorSize(r io.ReaderAt, sectorSize int, checkFsFuncs ...fs.CheckFsFunc) (types.Driver, error) {
+	mbrSectorSize := sectorSize
+	switch sectorSize {
+	case 0:
+		mbrSectorSize = mbr.Sector
+	case 512, 4096:
+	default:
+		return nil, xerrors.Errorf("unsupported sector size: %d", sectorSize)
+	}
+
+	m, err := mbr.NewMasterBootRecordWithSectorSize(r, mbrSectorSize)
 	if err != nil {
 		if xerrors.Is(err, mbr.EmptyPartitionTable) || xerrors.Is(err, mbr.InvalidSignature) {
 			ok, err := fs.CheckFileSystems(r, checkFsFuncs)
@@ -33,7 +52,7 @@ func NewDriver(r io.ReaderAt, checkFsFuncs ...fs.CheckFsFunc) (types.Driver, err
 		return m, nil
 	}
 
-	g, err := gpt.NewGUIDPartitionTable(r)
+	g, err := gpt.NewGUIDPartitionTableWithSectorSize(r, sectorSize)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to parse GUID partition table: %w", err)
 	}
